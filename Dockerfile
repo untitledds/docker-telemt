@@ -62,9 +62,9 @@ RUN case "$(apk --print-arch)" in \
 WORKDIR /src
 
 RUN --mount=type=cache,target=/root/.cache/git \
-    git clone --depth=1 --branch "${TELEMT_REF}" "${TELEMT_REPO}" . \
+    git -c advice.detachedHead=false clone --depth=1 --branch "${TELEMT_REF}" "${TELEMT_REPO}" . \
     || (git init . && git remote add origin "${TELEMT_REPO}" \
-        && git fetch --depth=1 origin "${TELEMT_REF}" \
+        && git -c advice.detachedHead=false fetch --depth=1 origin "${TELEMT_REF}" \
         && git checkout --detach FETCH_HEAD)
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -92,7 +92,7 @@ LABEL org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.title="telemt" \
       org.opencontainers.image.description="Telegram MTProto proxy (musl-static)" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
 
 STOPSIGNAL SIGINT
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
