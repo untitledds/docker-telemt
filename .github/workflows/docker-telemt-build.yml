@@ -1,0 +1,136 @@
+name: docker-telemt
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force build"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 */2 * * *"
+  push:
+    branches: ["master", "main"]
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/docker-telemt-build.yml"
+
+concurrency:
+  group: docker-telemt-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: untitledds/telemt
+  UPSTREAM_OWNER: telemt
+  UPSTREAM_REPO: telemt
+  RUST_VERSION: 1.94
+  STATE_FILE: .github/telemt-docker/state.json
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Check for new telemt release
+        id: check
+        run: |
+          mkdir -p "$(dirname "${STATE_FILE}")"
+          
+          # Читаем предыдущее состояние
+          prev_tag=""
+          [ -f "${STATE_FILE}" ] && prev_tag="$(jq -r '.release_tag' "${STATE_FILE}")"
+          
+          # Получаем последний релиз
+          release_json=$(curl -fsSL \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest")
+          
+          release_tag=$(echo "$release_json" | jq -r '.tag_name')
+          target=$(echo "$release_json" | jq -r '.target_commitish')
+          
+          # Резолвим SHA (важно для annotated tags)
+          if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
+            release_sha="$target"
+          else
+            # Получаем SHA через refs
+            ref_data=$(curl -fsSL \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/git/ref/tags/${release_tag}")
+            
+            ref_type=$(echo "$ref_data" | jq -r '.object.type')
+            
+            if [ "$ref_type" = "tag" ]; then
+              tag_sha=$(echo "$ref_data" | jq -r '.object.sha')
+              release_sha=$(curl -fsSL \
+                -H "Authorization: Bearer ${{ github.token }}" \
+                "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/git/tags/${tag_sha}" \
+                | jq -r '.object.sha')
+            else
+              release_sha=$(echo "$ref_data" | jq -r '.object.sha')
+            fi
+          fi
+          
+          # Решаем, нужно ли собирать
+          changed=false
+          if [ "$prev_tag" != "$release_tag" ] || [ "${{ github.event.inputs.force }}" == "true" ]; then
+            changed=true
+          fi
+          
+          echo "changed=$changed" >> $GITHUB_OUTPUT
+          echo "tag=$release_tag" >> $GITHUB_OUTPUT
+          echo "sha=$release_sha" >> $GITHUB_OUTPUT
+          echo "short_sha=${release_sha:0:12}" >> $GITHUB_OUTPUT
+          
+          # Логируем для отладки
+          echo "Previous tag: $prev_tag"
+          echo "Current tag: $release_tag"
+          echo "SHA: $release_sha"
+
+      - name: Build and push
+        if: steps.check.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.check.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.check.outputs.short_sha }}
+          build-args: |
+            TELEMT_REPO=https://github.com/${{ env.UPSTREAM_OWNER }}/${{ env.UPSTREAM_REPO }}.git
+            TELEMT_REF=${{ steps.check.outputs.tag }}
+            RUST_VERSION=${{ env.RUST_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Save state
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          jq -n \
+            --arg tag "${{ steps.check.outputs.tag }}" \
+            --arg sha "${{ steps.check.outputs.sha }}" \
+            '{release_tag: $tag, release_sha: $sha}' > "${STATE_FILE}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${STATE_FILE}"
+          git commit -m "chore: update to telemt ${{ steps.check.outputs.tag }}"
+          git push
